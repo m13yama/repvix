@@ -546,7 +546,8 @@ fn generates_standalone_bash_completion_outside_a_workspace() {
     let script = String::from_utf8(completion.stdout).unwrap();
     assert!(script.starts_with("# bash completion for repvix"));
     assert!(script.contains("init add import remove clone"));
-    assert!(script.contains("--url --regex --help"));
+    assert!(script.contains("--path --branch -b --help"));
+    assert!(script.contains("--url --regex --branch -b --help"));
     assert!(!script.contains("--from-base-path"));
     assert!(script.contains("complete -F _repvix repvix"));
 }

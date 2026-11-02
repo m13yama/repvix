@@ -26,9 +26,11 @@ repos:
   - name: frontend
     url: git@github.com:acme/frontend.git
     path: apps
+    branch: develop
   - name: api
     url: git@github.com:acme/api.git
     path: services
+    branch: release/next
 ```
 
 The destinations are `../sources/apps/frontend` and
@@ -50,8 +52,8 @@ mkdir my-workspace
 cd my-workspace
 
 repvix init --base-path ../sources
-repvix add git@github.com:acme/frontend.git --path apps
-repvix add git@github.com:acme/api.git --path services
+repvix add git@github.com:acme/frontend.git --path apps --branch develop
+repvix add git@github.com:acme/api.git --path services --branch release/next
 repvix clone
 repvix status
 ```
@@ -60,6 +62,28 @@ Every repository entry explicitly contains `name`, `url`, and `path`. When
 `--path` is omitted from `add`, repvix writes `path: .`; it does not omit the
 field. `name` must match the repository name derived from `url`, preventing a
 configuration edit from renaming the cloned directory.
+
+## Prepare repository branches
+
+Each repository can specify its own optional `branch` in `repvix.yaml`.
+`add --branch BRANCH` (or `-b BRANCH`) saves it in the configuration. Running
+`repvix clone` clones missing repositories on their configured branches and
+switches existing repositories to those branches. To change a configured
+branch, edit `branch` in the YAML and run `repvix clone` again.
+
+Without `branch`, new clones use the remote's default branch and existing
+repositories are left on their current branch. Existing configuration files
+without this field continue to work.
+
+Branch switching uses `git switch` without forcing or resetting changes. If
+local changes prevent switching, or a branch is unavailable, the command
+reports the failure, continues with the other repositories, and exits non-zero.
+It does not pull or fetch existing repositories; a newly published remote
+branch must first be fetched there. Switching existing repositories requires
+Git 2.23 or newer.
+
+`repvix branch NAME` and `repvix checkout BRANCH` remain temporary operations
+across all repositories; they do not change the branches saved in the YAML.
 
 ## Import existing repositories
 
@@ -96,6 +120,19 @@ repvix import ./src/existing-repository \
   --url git@github.com:acme/existing-repository.git
 ```
 
+Import also records each repository's current branch, including when using
+multiple paths or `--regex`. Re-importing updates the recorded branch. Use
+`--branch` (or `-b`) to record a different branch without switching the local
+repository; with multiple paths or a regex, it applies to every imported
+repository:
+
+```sh
+repvix import ./src/existing-repository --branch release/next
+```
+
+A repository with a detached HEAD requires an explicit `--branch` so the saved
+configuration can prepare a named branch later.
+
 Version 1 configuration files remain readable. Importing an already configured
 local destination replaces its local-path URL with the origin URL and saves the
 configuration in the explicit version 2 format.
@@ -128,8 +165,9 @@ repvix sync [--rebase]
 repvix exec -- cargo test
 ```
 
-`list` prints repository names, workspace-relative destinations, and remotes as
-an aligned table. `status` provides one row per repository with its branch,
+`list` prints repository names, workspace-relative destinations, configured
+branches (`-` when unspecified), and remotes as an aligned table. `status`
+provides one row per repository with its branch,
 upstream divergence, working-tree state, change counts, and destination, then
 prints a workspace summary. Interactive terminals use color to distinguish
 clean, changed, and error states; set `NO_COLOR` or pipe the output to disable

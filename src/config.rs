@@ -33,6 +33,9 @@ pub struct RepoConfig {
     /// A parent directory relative to workspace.base_path. This never renames
     /// the repository's own directory.
     pub path: PathBuf,
+    /// Branch to prepare. When omitted, new clones use the remote's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +145,9 @@ impl Config {
             }
             validate_repo_name(&repo.name)?;
             validate_repo_parent(&repo.path)?;
+            if let Some(branch) = &repo.branch {
+                validate_branch(branch)?;
+            }
             let derived_name = repo_name(&repo.url)?;
             if repo.name != derived_name {
                 return Err(Error::Config(format!(
@@ -215,6 +221,7 @@ fn migrate_legacy_config(value: serde_yaml::Value) -> Result<Config> {
                 name: repo_name(&repo.url)?,
                 url: repo.url,
                 path: repo.path.unwrap_or_else(|| PathBuf::from(".")),
+                branch: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -274,6 +281,29 @@ fn validate_repo_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_branch(branch: &str) -> Result<()> {
+    if branch.is_empty()
+        || branch == "HEAD"
+        || branch.starts_with('-')
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.bytes().any(|byte| {
+            byte <= b' '
+                || byte == 0x7f
+                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+        || branch
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return Err(Error::Config(format!(
+            "invalid repository branch: {branch:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_repo_parent(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
         return Err(Error::Config("repository path must not be empty".into()));
@@ -317,6 +347,7 @@ mod tests {
             name: "api".into(),
             url: "git@github.com:acme/api.git".into(),
             path: PathBuf::from("services/backend"),
+            branch: None,
         };
         assert_eq!(
             config.repo_destination(root, &repo).unwrap(),
@@ -332,6 +363,7 @@ mod tests {
             name: "api".into(),
             url: "https://github.com/acme/api.git".into(),
             path: PathBuf::from("../renamed"),
+            branch: None,
         };
         assert!(config.repo_destination(root, &repo).is_err());
     }
@@ -358,6 +390,7 @@ repos:
             name: "api".into(),
             url: "https://github.com/acme/api.git".into(),
             path: PathBuf::from("services"),
+            branch: Some("release/next".into()),
         });
         config.save(directory.path()).unwrap();
         assert_eq!(Config::load(directory.path()).unwrap(), config);
@@ -383,6 +416,7 @@ repos:
         assert_eq!(config.version, 2);
         assert_eq!(config.repos[0].name, "api");
         assert_eq!(config.repos[0].path, PathBuf::from("."));
+        assert_eq!(config.repos[0].branch, None);
     }
 
     #[test]
@@ -393,6 +427,7 @@ repos:
             name: "renamed-api".into(),
             url: "https://github.com/acme/api.git".into(),
             path: PathBuf::from("."),
+            branch: None,
         });
         assert!(config.validate(directory.path()).is_err());
     }

@@ -33,6 +33,9 @@ enum CliCommand {
         url: String,
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Branch to prepare when cloning this repository.
+        #[arg(short, long)]
+        branch: Option<String>,
     },
     /// Import one or more existing repositories below workspace.base_path.
     Import {
@@ -45,6 +48,9 @@ enum CliCommand {
         /// Override the repository's origin URL. Only valid with one repository.
         #[arg(long, conflicts_with = "regex")]
         url: Option<String>,
+        /// Record this branch instead of each repository's current branch.
+        #[arg(short, long)]
+        branch: Option<String>,
         /// Discover repositories below base_path matching a relative-path regex.
         #[arg(long)]
         regex: Option<String>,
@@ -62,7 +68,7 @@ enum CliCommand {
         #[arg(long)]
         regex: Option<String>,
     },
-    /// Clone all configured repositories.
+    /// Clone missing repositories and check out their configured branches.
     Clone,
     /// List repositories and their resolved destinations.
     List,
@@ -170,14 +176,15 @@ fn execute(
     match cli.command {
         CliCommand::Init { .. } => unreachable!(),
         CliCommand::Completions { .. } => unreachable!(),
-        CliCommand::Add { url, path } => {
-            let destination = app::add_repository(&mut config, &workspace_root, url, path)?;
+        CliCommand::Add { url, path, branch } => {
+            let destination = app::add_repository(&mut config, &workspace_root, url, path, branch)?;
             writeln!(output, "added repository -> {}", destination.display())
                 .map_err(|error| Error::io("failed to write output", error))
         }
         CliCommand::Import {
             mut repositories,
             url,
+            branch,
             regex,
         } => {
             if repositories.len() > 1 && url.is_some() {
@@ -203,6 +210,7 @@ fn execute(
                     &workspace_root,
                     &repositories[0],
                     url,
+                    branch,
                 )?;
                 let action = match imported.action {
                     app::ImportAction::Added => "imported",
@@ -221,6 +229,7 @@ fn execute(
                     &mut config,
                     &workspace_root,
                     &repositories,
+                    branch,
                     output,
                     output_options,
                 )
@@ -352,7 +361,7 @@ _repvix() {
             COMPREPLY=( $(compgen -d -- "$cur") )
             return
             ;;
-        --url|--name|--description|--regex)
+        --url|--name|--description|--regex|--branch|-b)
             return
             ;;
     esac
@@ -362,14 +371,14 @@ _repvix() {
             candidates="--name --base-path --help"
             ;;
         add)
-            candidates="--path --help"
+            candidates="--path --branch -b --help"
             ;;
         import)
             if [[ "$cur" != -* && " ${COMP_WORDS[*]} " != *" --regex "* ]]; then
                 COMPREPLY=( $(compgen -d -- "$cur") )
                 return
             fi
-            candidates="--url --regex --help"
+            candidates="--url --regex --branch -b --help"
             ;;
         remove)
             candidates="--regex --help $(repvix list 2>/dev/null | awk 'NR > 1 {print $1}')"

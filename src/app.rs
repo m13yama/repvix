@@ -98,11 +98,13 @@ pub fn add_repository(
     workspace_root: &Path,
     url: String,
     path: Option<PathBuf>,
+    branch: Option<String>,
 ) -> Result<PathBuf> {
     let repo = RepoConfig {
         name: crate::config::repo_name(&url)?,
         url,
         path: path.unwrap_or_else(|| PathBuf::from(".")),
+        branch,
     };
     let destination = config.repo_destination(workspace_root, &repo)?;
     config.repos.push(repo);
@@ -133,6 +135,7 @@ pub fn import_repository(
     workspace_root: &Path,
     repository_path: &Path,
     url_override: Option<String>,
+    branch_override: Option<String>,
 ) -> Result<ImportResult> {
     let repository_path = fs::canonicalize(repository_path).map_err(|error| {
         Error::io(
@@ -205,7 +208,25 @@ pub fn import_repository(
         )));
     }
 
-    let repo = RepoConfig { name, url, path };
+    let branch = match branch_override {
+        Some(branch) => branch,
+        None => {
+            let branch = git_capture(runner, &repository_path, &["branch", "--show-current"])?;
+            let branch = branch.trim_end_matches(['\r', '\n']).to_owned();
+            if branch.is_empty() {
+                return Err(Error::Usage(format!(
+                    "repository {name} has a detached HEAD; specify the branch to record with --branch"
+                )));
+            }
+            branch
+        }
+    };
+    let repo = RepoConfig {
+        name,
+        url,
+        path,
+        branch: Some(branch),
+    };
     let destination = config.repo_destination(workspace_root, &repo)?;
     let existing = config.repos.iter().position(|configured| {
         config
@@ -243,6 +264,7 @@ pub fn import_repositories(
     config: &mut Config,
     workspace_root: &Path,
     repository_paths: &[PathBuf],
+    branch_override: Option<String>,
     output: &mut dyn Write,
     options: OutputOptions,
 ) -> Result<()> {
@@ -258,7 +280,14 @@ pub fn import_repositories(
     let mut failures = Vec::new();
 
     for repository_path in repository_paths {
-        match import_repository(runner, config, workspace_root, repository_path, None) {
+        match import_repository(
+            runner,
+            config,
+            workspace_root,
+            repository_path,
+            None,
+            branch_override.clone(),
+        ) {
             Ok(result) => {
                 let action = match result.action {
                     ImportAction::Added => {
@@ -672,12 +701,27 @@ pub fn clone_repositories(
         let name = &repo.name;
         if destination.exists() {
             if destination.join(".git").exists() {
-                writeln!(
-                    output,
-                    "skip  {name}: already cloned at {}",
-                    destination.display()
-                )
-                .map_err(|error| Error::io("failed to write output", error))?;
+                if let Some(branch) = &repo.branch {
+                    writeln!(output, "checkout {name} -> {branch}")
+                        .map_err(|error| Error::io("failed to write output", error))?;
+                    let result = runner.run(&ProcessSpec {
+                        program: "git".into(),
+                        args: ["switch", "--", branch].map(OsString::from).to_vec(),
+                        cwd: Some(destination),
+                        capture: true,
+                    })?;
+                    write_captured(output, &result)?;
+                    if !result.success {
+                        failures += 1;
+                    }
+                } else {
+                    writeln!(
+                        output,
+                        "skip  {name}: already cloned at {}",
+                        destination.display()
+                    )
+                    .map_err(|error| Error::io("failed to write output", error))?;
+                }
             } else {
                 failures += 1;
                 writeln!(
@@ -696,14 +740,18 @@ pub fn clone_repositories(
         }
         writeln!(output, "clone {name} -> {}", destination.display())
             .map_err(|error| Error::io("failed to write output", error))?;
+        let mut args = vec![OsString::from("clone")];
+        if let Some(branch) = &repo.branch {
+            args.extend([OsString::from("--branch"), branch.into()]);
+        }
+        args.extend([
+            "--".into(),
+            repo.url.clone().into(),
+            destination.into_os_string(),
+        ]);
         let result = runner.run(&ProcessSpec {
             program: "git".into(),
-            args: vec![
-                "clone".into(),
-                "--".into(),
-                repo.url.clone().into(),
-                destination.clone().into_os_string(),
-            ],
+            args,
             cwd: None,
             capture: true,
         })?;
@@ -740,13 +788,14 @@ pub fn list_repositories_with_options(
         rows.push([
             TableCell::new(&repo.name, CellStyle::Accent),
             TableCell::plain(display_workspace_path(&destination, workspace_root)),
+            TableCell::plain(repo.branch.as_deref().unwrap_or("-")),
             TableCell::new(&repo.url, CellStyle::Muted),
         ]);
     }
 
     write_table(
         output,
-        ["NAME", "DESTINATION", "REMOTE"],
+        ["NAME", "DESTINATION", "BRANCH", "REMOTE"],
         &rows,
         options.color,
     )
@@ -1448,6 +1497,7 @@ mod tests {
             name: "api".into(),
             url: "git@github.com:acme/api.git".into(),
             path: PathBuf::from("backend"),
+            branch: None,
         });
         let runner = RecordingRunner::default();
         clone_repositories(&runner, &config, root, &mut Vec::new()).unwrap();
@@ -1469,6 +1519,7 @@ mod tests {
             name: "api".into(),
             url: "https://github.com/acme/api.git".into(),
             path: PathBuf::from("."),
+            branch: None,
         });
         fs::create_dir_all(root.join("repos/api/.git")).unwrap();
         let runner = RecordingRunner::default();
@@ -1525,6 +1576,7 @@ mod tests {
             name: "api".into(),
             url: "git@github.com:acme/api.git".into(),
             path: PathBuf::from("services"),
+            branch: Some("release/next".into()),
         });
         let mut output = Vec::new();
 
@@ -1546,6 +1598,7 @@ mod tests {
             name: "api".into(),
             url: "https://github.com/acme/api.git".into(),
             path: PathBuf::from("."),
+            branch: None,
         });
         let mut output = Vec::new();
 
