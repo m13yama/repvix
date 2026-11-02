@@ -41,8 +41,39 @@ There is intentionally no tag feature.
 
 ## Install
 
+Install the latest release on Linux or macOS (x86_64 or ARM64):
+
 ```sh
-cargo install --path .
+curl -fsSL https://github.com/m13yama/repvix/releases/latest/download/install.sh | bash
+```
+
+The installer downloads a prebuilt binary, verifies its SHA-256 checksum, and
+installs it to `~/.local/bin`. Rust and `sudo` are not required. Linux binaries
+are statically linked with musl. You need Bash, curl, tar, and either
+`sha256sum` (Linux) or `shasum` (macOS); Git is required to use repvix.
+
+If `~/.local/bin` is not already on your `PATH`, add this to your shell profile:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Run the installer again to upgrade. To select a release or installation directory:
+
+```sh
+curl -fsSL https://github.com/m13yama/repvix/releases/latest/download/install.sh \
+  | bash -s -- --version v1.2.0 --install-dir "$HOME/bin"
+```
+
+`REPVIX_VERSION` and `REPVIX_INSTALL_DIR` can also be passed as environment
+variables to `bash`. Use `bash -s -- --help` to see the options. Release assets
+must have been published by the workflow below; the original v1.0.0 and v1.1.0
+releases do not contain prebuilt binaries or the installer.
+
+To build from a local checkout instead:
+
+```sh
+cargo install --locked --path .
 ```
 
 ## Quick start
@@ -214,4 +245,29 @@ from the `bash-completion` package.
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
+python3 -m unittest discover -s tests -p 'test_install.py' -v
 ```
+
+## Publishing a release
+
+The `Build and release` GitHub Actions workflow tests and packages all four
+platforms on pull requests and pushes to `main`. Pushing a `v*` tag also creates
+a GitHub Release containing `install.sh`, one `repvix-<target>.tar.gz` archive per
+platform, and a matching `.sha256` file for each archive. All assets are uploaded
+to a draft before it is published. Tags with a prerelease suffix are published
+as prereleases and are available through `--version`.
+
+To publish a release, update the version in
+`Cargo.toml` (for example, to `1.2.0`), run `cargo check` to update `Cargo.lock`,
+and commit those files together with the installer and workflow. Then push the
+commit and its matching tag:
+
+```sh
+git push origin main
+git tag -a v1.2.0 -m "Release v1.2.0"
+git push origin v1.2.0
+```
+
+The tag must exactly match `v` plus the package version in `Cargo.toml`. Wait for
+the workflow to finish before using the curl command. Existing published
+releases are never overwritten; use a new version when publishing changes.
