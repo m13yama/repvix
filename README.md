@@ -69,10 +69,27 @@ An existing repository below `workspace.base_path` can be imported directly:
 repvix import ./src/existing-repository
 ```
 
+Import multiple repositories by listing all of their paths. Each repository is
+processed even if another one fails, and the command prints a result table and
+summary before returning a non-zero status when failures occurred:
+
+```sh
+repvix import ./src/frontend ./src/api ./src/worker
+```
+
+To discover repositories recursively below `workspace.base_path`, use a regular
+expression. The expression is matched against paths relative to the base path,
+such as `apps/frontend`. Use `.*` to import every discovered repository:
+
+```sh
+repvix import --regex '.*'
+repvix import --regex '^apps/'
+```
+
 The command verifies the Git top-level directory, reads the `origin` URL, and
 writes all required repository fields. The directory name must match the
 repository name in the origin URL. For a repository without an `origin`, pass
-the URL explicitly:
+the URL explicitly. `--url` is only available when importing one repository:
 
 ```sh
 repvix import ./src/existing-repository \
@@ -83,16 +100,40 @@ Version 1 configuration files remain readable. Importing an already configured
 local destination replaces its local-path URL with the origin URL and saves the
 configuration in the explicit version 2 format.
 
+## Remove repositories from the configuration
+
+`remove` only removes entries from `repvix.yaml`. Working directories and all
+files inside them are always kept. Multiple names or destinations can be
+specified, or repositories can be selected by their base-path-relative
+destination:
+
+```sh
+repvix remove api web
+repvix remove --regex '^apps/'
+```
+
+If any explicit name or destination is unknown, nothing is removed. After a
+repository is removed from the configuration, `sync` reports its remaining Git
+working directory as unconfigured and skips it.
+
 Available workspace commands:
 
 ```text
 repvix list
 repvix status
+repvix remove api
 repvix branch feature/example
 repvix checkout main
 repvix sync [--rebase]
 repvix exec -- cargo test
 ```
+
+`list` prints repository names, workspace-relative destinations, and remotes as
+an aligned table. `status` provides one row per repository with its branch,
+upstream divergence, working-tree state, change counts, and destination, then
+prints a workspace summary. Interactive terminals use color to distinguish
+clean, changed, and error states; set `NO_COLOR` or pipe the output to disable
+ANSI styling.
 
 Commands are executed directly rather than through a shell. Pipelines and
 redirections therefore require an explicit shell such as `sh -c`.

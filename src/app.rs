@@ -1,10 +1,23 @@
 use crate::config::{CONFIG_FILE, Config, RepoConfig, StoredCommand};
 use crate::process::{CommandRunner, ProcessOutput, ProcessSpec};
 use crate::{Error, Result};
+use regex::Regex;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutputOptions {
+    pub color: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositorySelector {
+    Names(Vec<String>),
+    Regex(String),
+}
 
 pub fn init_workspace(directory: &Path, name: String, base_path: PathBuf) -> Result<Config> {
     let config_path = directory.join(CONFIG_FILE);
@@ -225,6 +238,384 @@ pub fn import_repository(
     })
 }
 
+pub fn import_repositories(
+    runner: &impl CommandRunner,
+    config: &mut Config,
+    workspace_root: &Path,
+    repository_paths: &[PathBuf],
+    output: &mut dyn Write,
+    options: OutputOptions,
+) -> Result<()> {
+    if repository_paths.is_empty() {
+        return Err(Error::Usage(
+            "import requires at least one repository path".into(),
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(repository_paths.len());
+    let mut imported = 0usize;
+    let mut updated = 0usize;
+    let mut failures = Vec::new();
+
+    for repository_path in repository_paths {
+        match import_repository(runner, config, workspace_root, repository_path, None) {
+            Ok(result) => {
+                let action = match result.action {
+                    ImportAction::Added => {
+                        imported += 1;
+                        "imported"
+                    }
+                    ImportAction::Updated => {
+                        updated += 1;
+                        "updated"
+                    }
+                };
+                rows.push([
+                    TableCell::new(action, CellStyle::Good),
+                    TableCell::new(result.repo.name, CellStyle::Accent),
+                    TableCell::plain(display_workspace_path(&result.destination, workspace_root)),
+                ]);
+            }
+            Err(error) => {
+                rows.push([
+                    TableCell::new("failed", CellStyle::Bad),
+                    TableCell::new(
+                        display_workspace_path(repository_path, workspace_root),
+                        CellStyle::Accent,
+                    ),
+                    TableCell::new("-", CellStyle::Muted),
+                ]);
+                failures.push((repository_path.clone(), error.to_string()));
+            }
+        }
+    }
+
+    write_table(
+        output,
+        ["RESULT", "REPOSITORY", "DESTINATION"],
+        &rows,
+        options.color,
+    )?;
+    writeln!(output).map_err(|error| Error::io("failed to write output", error))?;
+    write_import_summary(output, imported, updated, failures.len(), options.color)?;
+
+    if !failures.is_empty() {
+        writeln!(output).map_err(|error| Error::io("failed to write output", error))?;
+        write_styled(output, "Errors", CellStyle::Header, options.color)?;
+        writeln!(output, ":").map_err(|error| Error::io("failed to write output", error))?;
+        for (path, message) in &failures {
+            writeln!(
+                output,
+                "  {}:",
+                display_workspace_path(path, workspace_root)
+            )
+            .map_err(|error| Error::io("failed to write output", error))?;
+            for line in message.lines() {
+                writeln!(output, "    {line}")
+                    .map_err(|error| Error::io("failed to write output", error))?;
+            }
+        }
+    }
+
+    finish_operation("import", failures.len())
+}
+
+pub fn find_repositories_matching(
+    config: &Config,
+    workspace_root: &Path,
+    pattern: &str,
+) -> Result<Vec<PathBuf>> {
+    let matcher = Regex::new(pattern)
+        .map_err(|error| Error::Usage(format!("invalid regular expression: {error}")))?;
+    let base_path = config.base_path(workspace_root);
+    if !base_path.is_dir() {
+        return Err(Error::Usage(format!(
+            "workspace base path does not exist or is not a directory: {}",
+            base_path.display()
+        )));
+    }
+
+    let mut repositories = Vec::new();
+    discover_git_repositories(&base_path, &base_path, Some(&matcher), &mut repositories)?;
+    repositories.sort();
+
+    if repositories.is_empty() {
+        return Err(Error::Usage(format!(
+            "no Git repositories matched `{pattern}` below {}",
+            base_path.display()
+        )));
+    }
+    Ok(repositories)
+}
+
+pub fn remove_repositories(
+    config: &mut Config,
+    workspace_root: &Path,
+    selector: RepositorySelector,
+    output: &mut dyn Write,
+    options: OutputOptions,
+) -> Result<()> {
+    let selected = select_repository_indices(config, workspace_root, selector)?;
+    let previous = config.repos.clone();
+    let mut removed = Vec::with_capacity(selected.len());
+    config.repos = previous
+        .iter()
+        .enumerate()
+        .filter_map(|(index, repo)| {
+            if selected.contains(&index) {
+                removed.push(repo.clone());
+                None
+            } else {
+                Some(repo.clone())
+            }
+        })
+        .collect();
+    if let Err(error) = config.save(workspace_root) {
+        config.repos = previous;
+        return Err(error);
+    }
+
+    let rows = removed
+        .iter()
+        .map(|repo| {
+            let destination = config.repo_destination(workspace_root, repo)?;
+            Ok([
+                TableCell::new("removed", CellStyle::Good),
+                TableCell::new(&repo.name, CellStyle::Accent),
+                TableCell::plain(display_workspace_path(&destination, workspace_root)),
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    write_table(
+        output,
+        ["RESULT", "REPOSITORY", "DESTINATION"],
+        &rows,
+        options.color,
+    )?;
+    writeln!(output).map_err(|error| Error::io("failed to write output", error))?;
+    let count = removed.len();
+    let repository = if count == 1 {
+        "repository"
+    } else {
+        "repositories"
+    };
+    let directory = if count == 1 {
+        "working directory was"
+    } else {
+        "working directories were"
+    };
+    write_styled(output, "Summary:", CellStyle::Header, options.color)?;
+    writeln!(
+        output,
+        " {count} {repository} removed from configuration; {directory} kept."
+    )
+    .map_err(|error| Error::io("failed to write output", error))
+}
+
+fn select_repository_indices(
+    config: &Config,
+    workspace_root: &Path,
+    selector: RepositorySelector,
+) -> Result<HashSet<usize>> {
+    let selected = match selector {
+        RepositorySelector::Regex(pattern) => {
+            let matcher = Regex::new(&pattern)
+                .map_err(|error| Error::Usage(format!("invalid regular expression: {error}")))?;
+            config
+                .repos
+                .iter()
+                .enumerate()
+                .filter_map(|(index, repo)| {
+                    matcher
+                        .is_match(&repository_base_relative_path(repo))
+                        .then_some(index)
+                })
+                .collect()
+        }
+        RepositorySelector::Names(names) => {
+            if names.is_empty() {
+                return Err(Error::Usage(
+                    "remove requires at least one repository name or destination".into(),
+                ));
+            }
+            let mut selected = HashSet::new();
+            let mut problems = Vec::new();
+            for name in names {
+                let requested = Path::new(&name);
+                let mut matches = Vec::new();
+                for (index, repo) in config.repos.iter().enumerate() {
+                    let destination = config.repo_destination(workspace_root, repo)?;
+                    let workspace_relative = destination
+                        .strip_prefix(workspace_root)
+                        .unwrap_or(&destination);
+                    if requested == repository_base_relative_path_buf(repo)
+                        || requested == destination
+                        || requested == workspace_relative
+                    {
+                        matches.push(index);
+                    }
+                }
+                if matches.is_empty() {
+                    matches.extend(
+                        config
+                            .repos
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, repo)| (repo.name == name).then_some(index)),
+                    );
+                }
+                match matches.as_slice() {
+                    [] => problems.push(format!("unknown repository: {name}")),
+                    [index] => {
+                        selected.insert(*index);
+                    }
+                    _ => problems.push(format!(
+                        "ambiguous repository name `{name}`; use its destination"
+                    )),
+                }
+            }
+            if !problems.is_empty() {
+                return Err(Error::Usage(problems.join("; ")));
+            }
+            selected
+        }
+    };
+
+    if selected.is_empty() {
+        return Err(Error::Usage("no repositories matched for removal".into()));
+    }
+    Ok(selected)
+}
+
+fn repository_base_relative_path(repo: &RepoConfig) -> String {
+    repository_base_relative_path_buf(repo)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn repository_base_relative_path_buf(repo: &RepoConfig) -> PathBuf {
+    if repo.path == Path::new(".") {
+        PathBuf::from(&repo.name)
+    } else {
+        repo.path.join(&repo.name)
+    }
+}
+
+fn discover_git_repositories(
+    directory: &Path,
+    base_path: &Path,
+    matcher: Option<&Regex>,
+    repositories: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| Error::io(format!("failed to read {}", directory.display()), error))?;
+    let mut entries = entries
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| Error::io(format!("failed to read {}", directory.display()), error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let file_type = entry.file_type().map_err(|error| {
+            Error::io(
+                format!("failed to inspect {}", entry.path().display()),
+                error,
+            )
+        })?;
+        if !file_type.is_dir() || entry.file_name() == ".git" {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.join(".git").exists() {
+            let relative = path.strip_prefix(base_path).map_err(|_| {
+                Error::Operation(format!(
+                    "discovered repository escaped base path: {}",
+                    path.display()
+                ))
+            })?;
+            let candidate = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if matcher.is_none_or(|matcher| matcher.is_match(&candidate)) {
+                repositories.push(path);
+            }
+            continue;
+        }
+
+        discover_git_repositories(&path, base_path, matcher, repositories)?;
+    }
+    Ok(())
+}
+
+fn warn_unconfigured_repositories(
+    config: &Config,
+    workspace_root: &Path,
+    output: &mut dyn Write,
+    options: OutputOptions,
+) -> Result<()> {
+    let base_path = config.base_path(workspace_root);
+    if !base_path.is_dir() {
+        return Ok(());
+    }
+
+    let mut discovered = Vec::new();
+    if let Err(error) = discover_git_repositories(&base_path, &base_path, None, &mut discovered) {
+        write_styled(output, "warning:", CellStyle::Warning, options.color)?;
+        writeln!(
+            output,
+            " could not check for unconfigured repositories: {error}"
+        )
+        .map_err(|error| Error::io("failed to write output", error))?;
+        writeln!(output).map_err(|error| Error::io("failed to write output", error))?;
+        return Ok(());
+    }
+    let configured = config
+        .repos
+        .iter()
+        .map(|repo| config.repo_destination(workspace_root, repo))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|path| fs::canonicalize(&path).unwrap_or(path))
+        .collect::<HashSet<_>>();
+    let mut unconfigured = discovered
+        .into_iter()
+        .filter(|path| {
+            let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            !configured.contains(&normalized)
+        })
+        .collect::<Vec<_>>();
+    unconfigured.sort();
+    if unconfigured.is_empty() {
+        return Ok(());
+    }
+
+    let count = unconfigured.len();
+    let repositories = if count == 1 {
+        "repository is"
+    } else {
+        "repositories are"
+    };
+    write_styled(output, "warning:", CellStyle::Warning, options.color)?;
+    writeln!(
+        output,
+        " {count} Git {repositories} not configured and will be skipped by sync:"
+    )
+    .map_err(|error| Error::io("failed to write output", error))?;
+    for path in unconfigured {
+        writeln!(
+            output,
+            "  {}",
+            display_workspace_path(&path, workspace_root)
+        )
+        .map_err(|error| Error::io("failed to write output", error))?;
+    }
+    writeln!(output).map_err(|error| Error::io("failed to write output", error))
+}
+
 fn git_capture(runner: &impl CommandRunner, cwd: &Path, args: &[&str]) -> Result<String> {
     let result = runner.run(&ProcessSpec {
         program: "git".into(),
@@ -329,13 +720,36 @@ pub fn list_repositories(
     workspace_root: &Path,
     output: &mut dyn Write,
 ) -> Result<()> {
-    for repo in &config.repos {
-        let name = &repo.name;
-        let destination = config.repo_destination(workspace_root, repo)?;
-        writeln!(output, "{name}\t{}\t{}", destination.display(), repo.url)
-            .map_err(|error| Error::io("failed to write output", error))?;
+    list_repositories_with_options(config, workspace_root, output, OutputOptions::default())
+}
+
+pub fn list_repositories_with_options(
+    config: &Config,
+    workspace_root: &Path,
+    output: &mut dyn Write,
+    options: OutputOptions,
+) -> Result<()> {
+    if config.repos.is_empty() {
+        return writeln!(output, "No repositories configured.")
+            .map_err(|error| Error::io("failed to write output", error));
     }
-    Ok(())
+
+    let mut rows = Vec::with_capacity(config.repos.len());
+    for repo in &config.repos {
+        let destination = config.repo_destination(workspace_root, repo)?;
+        rows.push([
+            TableCell::new(&repo.name, CellStyle::Accent),
+            TableCell::plain(display_workspace_path(&destination, workspace_root)),
+            TableCell::new(&repo.url, CellStyle::Muted),
+        ]);
+    }
+
+    write_table(
+        output,
+        ["NAME", "DESTINATION", "REMOTE"],
+        &rows,
+        options.color,
+    )
 }
 
 pub fn git_status(
@@ -344,14 +758,451 @@ pub fn git_status(
     workspace_root: &Path,
     output: &mut dyn Write,
 ) -> Result<()> {
-    run_git_for_all(
+    git_status_with_options(
         runner,
         config,
         workspace_root,
-        &["status", "--short", "--branch"],
-        "status",
         output,
+        OutputOptions::default(),
     )
+}
+
+pub fn git_status_with_options(
+    runner: &impl CommandRunner,
+    config: &Config,
+    workspace_root: &Path,
+    output: &mut dyn Write,
+    options: OutputOptions,
+) -> Result<()> {
+    if config.repos.is_empty() {
+        return writeln!(output, "No repositories configured.")
+            .map_err(|error| Error::io("failed to write output", error));
+    }
+
+    let mut rows = Vec::with_capacity(config.repos.len());
+    let mut failures = 0usize;
+    let mut errors = Vec::new();
+    let mut totals = StatusTotals::default();
+
+    for repo in &config.repos {
+        let destination = config.repo_destination(workspace_root, repo)?;
+        let path = display_workspace_path(&destination, workspace_root);
+        if !destination.join(".git").exists() {
+            failures += 1;
+            totals.not_cloned += 1;
+            rows.push(status_row(
+                &repo.name,
+                "-",
+                "-",
+                "not cloned",
+                "-",
+                path,
+                CellStyle::Bad,
+            ));
+            continue;
+        }
+
+        let result = runner.run(&ProcessSpec {
+            program: "git".into(),
+            args: [
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--untracked-files=normal",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+            cwd: Some(destination),
+            capture: true,
+        })?;
+
+        if !result.success {
+            failures += 1;
+            totals.errors += 1;
+            let code = display_code(result.code);
+            let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+            if !message.is_empty() {
+                errors.push((repo.name.clone(), message));
+            }
+            rows.push(status_row(
+                &repo.name,
+                "-",
+                "-",
+                "error",
+                format!("exit {code}"),
+                path,
+                CellStyle::Bad,
+            ));
+            continue;
+        }
+
+        let source = match std::str::from_utf8(&result.stdout) {
+            Ok(source) => source,
+            Err(_) => {
+                failures += 1;
+                totals.errors += 1;
+                errors.push((repo.name.clone(), "Git output was not valid UTF-8".into()));
+                rows.push(status_row(
+                    &repo.name,
+                    "-",
+                    "-",
+                    "error",
+                    "invalid Git output",
+                    path,
+                    CellStyle::Bad,
+                ));
+                continue;
+            }
+        };
+        let summary = parse_git_status(source);
+        let (state, state_style) = if summary.conflicts > 0 {
+            totals.conflicts += 1;
+            ("conflict", CellStyle::Bad)
+        } else if summary.has_changes() {
+            totals.changed += 1;
+            ("changed", CellStyle::Warning)
+        } else {
+            totals.clean += 1;
+            ("clean", CellStyle::Good)
+        };
+        rows.push(status_row(
+            &repo.name,
+            summary.display_branch(),
+            summary.display_sync(),
+            state,
+            summary.display_changes(),
+            path,
+            state_style,
+        ));
+    }
+
+    write_table(
+        output,
+        ["NAME", "BRANCH", "SYNC", "STATE", "CHANGES", "DESTINATION"],
+        &rows,
+        options.color,
+    )?;
+    writeln!(output).map_err(|error| Error::io("failed to write output", error))?;
+    write_status_summary(output, totals, options.color)?;
+
+    if !errors.is_empty() {
+        writeln!(output).map_err(|error| Error::io("failed to write output", error))?;
+        write_styled(output, "Errors", CellStyle::Header, options.color)?;
+        writeln!(output, ":").map_err(|error| Error::io("failed to write output", error))?;
+        for (name, message) in errors {
+            writeln!(output, "  {name}: {message}")
+                .map_err(|error| Error::io("failed to write output", error))?;
+        }
+    }
+
+    finish_operation("status", failures)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellStyle {
+    Plain,
+    Header,
+    Accent,
+    Muted,
+    Good,
+    Warning,
+    Bad,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableCell {
+    text: String,
+    style: CellStyle,
+}
+
+impl TableCell {
+    fn new(text: impl Into<String>, style: CellStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+
+    fn plain(text: impl Into<String>) -> Self {
+        Self::new(text, CellStyle::Plain)
+    }
+}
+
+fn write_table<const COLUMNS: usize>(
+    output: &mut dyn Write,
+    headers: [&str; COLUMNS],
+    rows: &[[TableCell; COLUMNS]],
+    color: bool,
+) -> Result<()> {
+    let mut widths = headers.map(|header| header.chars().count());
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.text.chars().count());
+        }
+    }
+
+    for (index, header) in headers.iter().enumerate() {
+        write_styled(output, header, CellStyle::Header, color)?;
+        write_column_gap(
+            output,
+            widths[index] - header.chars().count(),
+            index,
+            COLUMNS,
+        )?;
+    }
+    writeln!(output).map_err(|error| Error::io("failed to write output", error))?;
+
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            write_styled(output, &cell.text, cell.style, color)?;
+            write_column_gap(
+                output,
+                widths[index] - cell.text.chars().count(),
+                index,
+                COLUMNS,
+            )?;
+        }
+        writeln!(output).map_err(|error| Error::io("failed to write output", error))?;
+    }
+    Ok(())
+}
+
+fn write_column_gap(
+    output: &mut dyn Write,
+    padding: usize,
+    index: usize,
+    columns: usize,
+) -> Result<()> {
+    if index + 1 == columns {
+        return Ok(());
+    }
+    write!(output, "{:width$}", "", width = padding + 2)
+        .map_err(|error| Error::io("failed to write output", error))
+}
+
+fn write_styled(output: &mut dyn Write, text: &str, style: CellStyle, color: bool) -> Result<()> {
+    let escape = match style {
+        CellStyle::Plain => "",
+        CellStyle::Header => "\x1b[1m",
+        CellStyle::Accent => "\x1b[1;36m",
+        CellStyle::Muted => "\x1b[2m",
+        CellStyle::Good => "\x1b[32m",
+        CellStyle::Warning => "\x1b[33m",
+        CellStyle::Bad => "\x1b[31m",
+    };
+    if color && !escape.is_empty() {
+        write!(output, "{escape}{text}\x1b[0m")
+    } else {
+        write!(output, "{text}")
+    }
+    .map_err(|error| Error::io("failed to write output", error))
+}
+
+fn display_workspace_path(path: &Path, workspace_root: &Path) -> String {
+    match path.strip_prefix(workspace_root) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+fn status_row(
+    name: impl Into<String>,
+    branch: impl Into<String>,
+    sync: impl Into<String>,
+    state: impl Into<String>,
+    changes: impl Into<String>,
+    destination: impl Into<String>,
+    state_style: CellStyle,
+) -> [TableCell; 6] {
+    let sync = sync.into();
+    let sync_style = if sync == "-" {
+        CellStyle::Muted
+    } else if sync == "up to date" {
+        CellStyle::Good
+    } else {
+        CellStyle::Warning
+    };
+    let changes = changes.into();
+    let changes_style = if changes == "-" {
+        CellStyle::Muted
+    } else {
+        state_style
+    };
+    [
+        TableCell::new(name, CellStyle::Accent),
+        TableCell::new(branch, CellStyle::Accent),
+        TableCell::new(sync, sync_style),
+        TableCell::new(state, state_style),
+        TableCell::new(changes, changes_style),
+        TableCell::new(destination, CellStyle::Muted),
+    ]
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GitStatusSummary {
+    branch: Option<String>,
+    oid: Option<String>,
+    upstream: Option<String>,
+    ahead: usize,
+    behind: usize,
+    staged: usize,
+    modified: usize,
+    untracked: usize,
+    conflicts: usize,
+}
+
+impl GitStatusSummary {
+    fn has_changes(&self) -> bool {
+        self.staged + self.modified + self.untracked + self.conflicts > 0
+    }
+
+    fn display_branch(&self) -> String {
+        match self.branch.as_deref() {
+            Some("(detached)") => self
+                .oid
+                .as_deref()
+                .filter(|oid| !oid.starts_with('('))
+                .map(|oid| format!("detached@{}", &oid[..oid.len().min(7)]))
+                .unwrap_or_else(|| "detached".into()),
+            Some(branch) => branch.into(),
+            None => "-".into(),
+        }
+    }
+
+    fn display_sync(&self) -> String {
+        if self.upstream.is_none() {
+            return "-".into();
+        }
+        match (self.ahead, self.behind) {
+            (0, 0) => "up to date".into(),
+            (ahead, 0) => format!("↑{ahead}"),
+            (0, behind) => format!("↓{behind}"),
+            (ahead, behind) => format!("↑{ahead} ↓{behind}"),
+        }
+    }
+
+    fn display_changes(&self) -> String {
+        let mut changes = Vec::new();
+        if self.staged > 0 {
+            changes.push(format!("{} staged", self.staged));
+        }
+        if self.modified > 0 {
+            changes.push(format!("{} modified", self.modified));
+        }
+        if self.untracked > 0 {
+            changes.push(format!("{} untracked", self.untracked));
+        }
+        if self.conflicts > 0 {
+            changes.push(format!("{} conflicted", self.conflicts));
+        }
+        if changes.is_empty() {
+            "-".into()
+        } else {
+            changes.join(", ")
+        }
+    }
+}
+
+fn parse_git_status(source: &str) -> GitStatusSummary {
+    let mut summary = GitStatusSummary::default();
+    for line in source.lines() {
+        if let Some(value) = line.strip_prefix("# branch.oid ") {
+            summary.oid = Some(value.into());
+        } else if let Some(value) = line.strip_prefix("# branch.head ") {
+            summary.branch = Some(value.into());
+        } else if let Some(value) = line.strip_prefix("# branch.upstream ") {
+            summary.upstream = Some(value.into());
+        } else if let Some(value) = line.strip_prefix("# branch.ab ") {
+            for count in value.split_ascii_whitespace() {
+                if let Some(ahead) = count.strip_prefix('+') {
+                    summary.ahead = ahead.parse().unwrap_or(0);
+                } else if let Some(behind) = count.strip_prefix('-') {
+                    summary.behind = behind.parse().unwrap_or(0);
+                }
+            }
+        } else if line.starts_with("1 ") || line.starts_with("2 ") {
+            if let Some(status) = line.split_ascii_whitespace().nth(1) {
+                let mut status = status.chars();
+                if status.next().is_some_and(|value| value != '.') {
+                    summary.staged += 1;
+                }
+                if status.next().is_some_and(|value| value != '.') {
+                    summary.modified += 1;
+                }
+            }
+        } else if line.starts_with("u ") {
+            summary.conflicts += 1;
+        } else if line.starts_with("? ") {
+            summary.untracked += 1;
+        }
+    }
+    summary
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StatusTotals {
+    clean: usize,
+    changed: usize,
+    conflicts: usize,
+    not_cloned: usize,
+    errors: usize,
+}
+
+fn write_import_summary(
+    output: &mut dyn Write,
+    imported: usize,
+    updated: usize,
+    failed: usize,
+    color: bool,
+) -> Result<()> {
+    write_styled(output, "Summary:", CellStyle::Header, color)?;
+    write!(output, " ").map_err(|error| Error::io("failed to write output", error))?;
+    write_styled(
+        output,
+        &format!("{imported} imported"),
+        CellStyle::Good,
+        color,
+    )?;
+    write!(output, ", ").map_err(|error| Error::io("failed to write output", error))?;
+    write_styled(
+        output,
+        &format!("{updated} updated"),
+        CellStyle::Accent,
+        color,
+    )?;
+    if failed > 0 {
+        write!(output, ", ").map_err(|error| Error::io("failed to write output", error))?;
+        write_styled(output, &format!("{failed} failed"), CellStyle::Bad, color)?;
+    }
+    writeln!(output).map_err(|error| Error::io("failed to write output", error))
+}
+
+fn write_status_summary(output: &mut dyn Write, totals: StatusTotals, color: bool) -> Result<()> {
+    write_styled(output, "Summary:", CellStyle::Header, color)?;
+    let items = [
+        (totals.clean, "clean", CellStyle::Good),
+        (totals.changed, "changed", CellStyle::Warning),
+        (totals.conflicts, "conflict", CellStyle::Bad),
+        (totals.not_cloned, "not cloned", CellStyle::Bad),
+        (totals.errors, "error", CellStyle::Bad),
+    ];
+    let mut first = true;
+    for (count, label, style) in items {
+        if count == 0 {
+            continue;
+        }
+        if first {
+            write!(output, " ").map_err(|error| Error::io("failed to write output", error))?;
+            first = false;
+        } else {
+            write!(output, ", ").map_err(|error| Error::io("failed to write output", error))?;
+        }
+        write_styled(output, &format!("{count} {label}"), style, color)?;
+    }
+    writeln!(output).map_err(|error| Error::io("failed to write output", error))
 }
 
 pub fn create_branch(
@@ -395,6 +1246,25 @@ pub fn sync(
     rebase: bool,
     output: &mut dyn Write,
 ) -> Result<()> {
+    sync_with_options(
+        runner,
+        config,
+        workspace_root,
+        rebase,
+        output,
+        OutputOptions::default(),
+    )
+}
+
+pub fn sync_with_options(
+    runner: &impl CommandRunner,
+    config: &Config,
+    workspace_root: &Path,
+    rebase: bool,
+    output: &mut dyn Write,
+    options: OutputOptions,
+) -> Result<()> {
+    warn_unconfigured_repositories(config, workspace_root, output, options)?;
     let args = if rebase {
         vec!["pull", "--rebase"]
     } else {
@@ -534,8 +1404,13 @@ fn finish_operation(operation: &str, failures: usize) -> Result<()> {
     if failures == 0 {
         Ok(())
     } else {
+        let repositories = if failures == 1 {
+            "repository"
+        } else {
+            "repositories"
+        };
         Err(Error::Operation(format!(
-            "{operation} failed for {failures} repository/repositories"
+            "{operation} failed for {failures} {repositories}"
         )))
     }
 }
@@ -602,6 +1477,84 @@ mod tests {
         let calls = runner.calls.borrow();
         assert_eq!(calls[0].cwd, Some(root.join("repos/api")));
         assert_eq!(calls[0].program, OsString::from("git"));
+        assert_eq!(
+            calls[0].args,
+            [
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--untracked-files=normal",
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn parses_branch_sync_and_change_counts_from_porcelain_v2() {
+        let summary = parse_git_status(
+            "# branch.oid 0123456789abcdef\n\
+             # branch.head feature/dashboard\n\
+             # branch.upstream origin/feature/dashboard\n\
+             # branch.ab +2 -1\n\
+             1 M. N... 100644 100644 100644 a b staged.txt\n\
+             1 .M N... 100644 100644 100644 a b modified.txt\n\
+             2 RM N... 100644 100644 100644 a b R100 renamed.txt\n\
+             u UU N... 100644 100644 100644 100644 a b c conflict.txt\n\
+             ? notes.txt\n",
+        );
+
+        assert_eq!(summary.display_branch(), "feature/dashboard");
+        assert_eq!(summary.display_sync(), "↑2 ↓1");
+        assert_eq!(summary.staged, 2);
+        assert_eq!(summary.modified, 2);
+        assert_eq!(summary.untracked, 1);
+        assert_eq!(summary.conflicts, 1);
+        assert_eq!(
+            summary.display_changes(),
+            "2 staged, 2 modified, 1 untracked, 1 conflicted"
+        );
+    }
+
+    #[test]
+    fn list_uses_a_header_and_workspace_relative_destinations() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let mut config = Config::new("demo".into(), PathBuf::from("sources"));
+        config.repos.push(RepoConfig {
+            name: "api".into(),
+            url: "git@github.com:acme/api.git".into(),
+            path: PathBuf::from("services"),
+        });
+        let mut output = Vec::new();
+
+        list_repositories(&config, root, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("NAME  DESTINATION"), "{output}");
+        assert!(output.contains("api   sources/services/api"), "{output}");
+        assert!(!output.contains(&root.display().to_string()), "{output}");
+        assert!(!output.contains('\t'), "{output}");
+    }
+
+    #[test]
+    fn colored_tables_keep_alignment_outside_escape_sequences() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let mut config = Config::new("demo".into(), PathBuf::from("repos"));
+        config.repos.push(RepoConfig {
+            name: "api".into(),
+            url: "https://github.com/acme/api.git".into(),
+            path: PathBuf::from("."),
+        });
+        let mut output = Vec::new();
+
+        list_repositories_with_options(&config, root, &mut output, OutputOptions { color: true })
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1mNAME\x1b[0m"), "{output:?}");
+        assert!(output.contains("\x1b[1;36mapi\x1b[0m"), "{output:?}");
     }
 
     #[test]

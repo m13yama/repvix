@@ -4,7 +4,7 @@ use crate::process::SystemRunner;
 use crate::{Error, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -34,12 +34,33 @@ enum CliCommand {
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    /// Import an existing repository below workspace.base_path.
+    /// Import one or more existing repositories below workspace.base_path.
     Import {
-        repository: PathBuf,
-        /// Override the repository's origin URL.
-        #[arg(long)]
+        #[arg(
+            num_args = 1..,
+            required_unless_present = "regex",
+            conflicts_with = "regex"
+        )]
+        repositories: Vec<PathBuf>,
+        /// Override the repository's origin URL. Only valid with one repository.
+        #[arg(long, conflicts_with = "regex")]
         url: Option<String>,
+        /// Discover repositories below base_path matching a relative-path regex.
+        #[arg(long)]
+        regex: Option<String>,
+    },
+    /// Remove repositories from repvix.yaml without deleting working directories.
+    Remove {
+        /// Repository names or destinations.
+        #[arg(
+            num_args = 1..,
+            required_unless_present = "regex",
+            conflicts_with = "regex"
+        )]
+        repositories: Vec<String>,
+        /// Select repositories by their base-path-relative destination.
+        #[arg(long)]
+        regex: Option<String>,
     },
     /// Clone all configured repositories.
     Clone,
@@ -107,11 +128,23 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let current = std::env::current_dir()
         .map_err(|error| Error::io("failed to determine current directory", error))?;
-    let mut stdout = io::stdout().lock();
-    execute(cli, &current, &SystemRunner, &mut stdout)
+    let stdout = io::stdout();
+    let output_options = app::OutputOptions {
+        color: stdout.is_terminal()
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::env::var_os("TERM").is_none_or(|term| term != "dumb"),
+    };
+    let mut stdout = stdout.lock();
+    execute(cli, &current, &SystemRunner, &mut stdout, output_options)
 }
 
-fn execute(cli: Cli, current: &Path, runner: &SystemRunner, output: &mut dyn Write) -> Result<()> {
+fn execute(
+    cli: Cli,
+    current: &Path,
+    runner: &SystemRunner,
+    output: &mut dyn Write,
+    output_options: app::OutputOptions,
+) -> Result<()> {
     if let CliCommand::Completions { shell } = cli.command {
         return generate_completions(shell, output);
     }
@@ -142,36 +175,94 @@ fn execute(cli: Cli, current: &Path, runner: &SystemRunner, output: &mut dyn Wri
             writeln!(output, "added repository -> {}", destination.display())
                 .map_err(|error| Error::io("failed to write output", error))
         }
-        CliCommand::Import { repository, url } => {
-            let repository = if repository.is_absolute() {
-                repository
+        CliCommand::Import {
+            mut repositories,
+            url,
+            regex,
+        } => {
+            if repositories.len() > 1 && url.is_some() {
+                return Err(Error::Usage(
+                    "--url can only be used when importing one repository".into(),
+                ));
+            }
+            let regex_mode = regex.is_some();
+            if let Some(regex) = regex.as_deref() {
+                repositories = app::find_repositories_matching(&config, &workspace_root, regex)?;
             } else {
-                current.join(repository)
+                for repository in &mut repositories {
+                    if !repository.is_absolute() {
+                        *repository = current.join(&*repository);
+                    }
+                }
+            }
+
+            if repositories.len() == 1 && !regex_mode {
+                let imported = app::import_repository(
+                    runner,
+                    &mut config,
+                    &workspace_root,
+                    &repositories[0],
+                    url,
+                )?;
+                let action = match imported.action {
+                    app::ImportAction::Added => "imported",
+                    app::ImportAction::Updated => "updated",
+                };
+                writeln!(
+                    output,
+                    "{action} {} -> {}",
+                    imported.repo.name,
+                    imported.destination.display()
+                )
+                .map_err(|error| Error::io("failed to write output", error))
+            } else {
+                app::import_repositories(
+                    runner,
+                    &mut config,
+                    &workspace_root,
+                    &repositories,
+                    output,
+                    output_options,
+                )
+            }
+        }
+        CliCommand::Remove {
+            repositories,
+            regex,
+        } => {
+            let selector = match regex {
+                Some(regex) => app::RepositorySelector::Regex(regex),
+                None => app::RepositorySelector::Names(repositories),
             };
-            let imported =
-                app::import_repository(runner, &mut config, &workspace_root, &repository, url)?;
-            let action = match imported.action {
-                app::ImportAction::Added => "imported",
-                app::ImportAction::Updated => "updated",
-            };
-            writeln!(
+            app::remove_repositories(
+                &mut config,
+                &workspace_root,
+                selector,
                 output,
-                "{action} {} -> {}",
-                imported.repo.name,
-                imported.destination.display()
+                output_options,
             )
-            .map_err(|error| Error::io("failed to write output", error))
         }
         CliCommand::Clone => app::clone_repositories(runner, &config, &workspace_root, output),
-        CliCommand::List => app::list_repositories(&config, &workspace_root, output),
-        CliCommand::Status => app::git_status(runner, &config, &workspace_root, output),
+        CliCommand::List => {
+            app::list_repositories_with_options(&config, &workspace_root, output, output_options)
+        }
+        CliCommand::Status => {
+            app::git_status_with_options(runner, &config, &workspace_root, output, output_options)
+        }
         CliCommand::Branch { name } => {
             app::create_branch(runner, &config, &workspace_root, &name, output)
         }
         CliCommand::Checkout { branch } => {
             app::checkout(runner, &config, &workspace_root, &branch, output)
         }
-        CliCommand::Sync { rebase } => app::sync(runner, &config, &workspace_root, rebase, output),
+        CliCommand::Sync { rebase } => app::sync_with_options(
+            runner,
+            &config,
+            &workspace_root,
+            rebase,
+            output,
+            output_options,
+        ),
         CliCommand::Exec(args) => {
             let mut command = args.command.into_iter();
             let program = command
@@ -251,7 +342,7 @@ _repvix() {
     command="${COMP_WORDS[1]}"
 
     if (( COMP_CWORD == 1 )); then
-        candidates="init add import clone list status branch checkout sync exec command run completions help"
+        candidates="init add import remove clone list status branch checkout sync exec command run completions help"
         COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
         return
     fi
@@ -261,7 +352,7 @@ _repvix() {
             COMPREPLY=( $(compgen -d -- "$cur") )
             return
             ;;
-        --url|--name|--description)
+        --url|--name|--description|--regex)
             return
             ;;
     esac
@@ -274,11 +365,14 @@ _repvix() {
             candidates="--path --help"
             ;;
         import)
-            if [[ "$cur" != -* ]]; then
+            if [[ "$cur" != -* && " ${COMP_WORDS[*]} " != *" --regex "* ]]; then
                 COMPREPLY=( $(compgen -d -- "$cur") )
                 return
             fi
-            candidates="--url --help"
+            candidates="--url --regex --help"
+            ;;
+        remove)
+            candidates="--regex --help $(repvix list 2>/dev/null | awk 'NR > 1 {print $1}')"
             ;;
         clone|list|status)
             candidates="--help"
@@ -325,7 +419,7 @@ _repvix() {
             candidates="bash --help"
             ;;
         help)
-            candidates="init add import clone list status branch checkout sync exec command run completions"
+            candidates="init add import remove clone list status branch checkout sync exec command run completions"
             ;;
         *)
             candidates="--help --version"
