@@ -1,0 +1,9 @@
+Generated with the built-in image_gen tool.
+
+Use case: logo-brand
+Asset type: square icon for repvix, a Rust command-line tool that manages multiple Git repositories as one workspace; used at 128px in a GitHub README and as a small project avatar.
+Primary request: Create one original, minimal, memorable icon. Combine three repository nodes and their connecting branches into one strong V-shaped symbol, conveying multiple repositories managed together.
+Style/medium: flat vector-like graphic with crisp edges, bold simple geometry, balanced negative space, and a restrained high-contrast palette appropriate for a Rust developer tool. Take inspiration from the clarity and economy of established Rust CLI identities such as bat and fd, without copying their marks.
+Composition/framing: a single centered isolated symbol on a square canvas, generous even padding, readable silhouette at small sizes; all parts feel like one cohesive mark.
+Scene/backdrop: genuinely transparent background. Ensure the symbol remains legible on both white and dark GitHub backgrounds.
+Constraints: no text, no letters rendered as typography, no wordmark, no mascots, no Rust gear logo, no gradients, no shadows, no mockup, no border or app tile, no watermark. Return only the finished icon.

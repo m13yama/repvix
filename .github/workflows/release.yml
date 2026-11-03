@@ -57,7 +57,7 @@ jobs:
         run: |
           mkdir -p dist
           asset="repvix-$TARGET.tar.gz"
-          tar -czf "dist/$asset" -C "target/$TARGET/release" repvix -C "$GITHUB_WORKSPACE" LICENSE README.md
+          tar -czf "dist/$asset" -C "target/$TARGET/release" repvix -C "$GITHUB_WORKSPACE" LICENSE README.md CONTRIBUTING.md docs assets
           (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
           cp install.sh dist/install.sh
           echo "REPVIX_TEST_ARCHIVE=$GITHUB_WORKSPACE/dist/$asset" >> "$GITHUB_ENV"
